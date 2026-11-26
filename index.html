@@ -52,6 +52,9 @@
   table.data th.sub { background: #f2f9fa; font-weight: normal; font-size: 11px; color: #54707c; }
   table.data td.num, table.data th.num { text-align: right; white-space: nowrap; }
   table.data tbody tr:hover td { background: #f2fafb; }
+  /* ringan: baris di luar layar dilewati layout/paint-nya oleh browser
+     (teruji Chromium 2026-11-26: geometri & batas sel identik) */
+  #tableWrap tbody tr { content-visibility: auto; contain-intrinsic-size: auto 37px; }
   table.data tr.grp td { background: #d9efe9; font-weight: bold; color: #083344; }
   table.data tr.tot td { background: #eef4f5; }
   table.data tr.chg td { background: #fff3cd; }
@@ -162,6 +165,7 @@
   .startSince { letter-spacing: 4px; font-size: 11.5px; font-weight: 700; }
   @page { size: landscape; margin: 10mm; }
   @media print {
+    #tableWrap tbody tr { content-visibility: visible; contain-intrinsic-size: none; }
     .noprint { display: none !important; }
     #loadingOverlay { display: none !important; }
     #loginOverlay { display: none !important; }
@@ -2124,6 +2128,66 @@ if (typeof module !== 'undefined' && module.exports) {
   ];
   var NCOL_LATEST = 3 + DISPLAY_COLS.length;
 
+  /* ---------- render tabel bertahap: potongan pertama tampil seketika,
+     sisanya mengalir per frame — halaman ringan dibuka walau 10rb+ baris.
+     Di lingkungan tanpa requestAnimationFrame (uji otomatis) render penuh
+     langsung seperti biasa. Klik sel ditangani delegasi di init(). ---------- */
+  var renderSeq = 0, streamState = null;
+  function tbodyEl_() {
+    if (!document.querySelectorAll) return null;
+    var tbs = document.querySelectorAll('#tableWrap tbody');
+    return (tbs && tbs[0]) || null;
+  }
+  function splitRows_(body, per) {
+    var parts = body.split('</tr>');
+    var chunks = [], cur = '', n = 0;
+    for (var i = 0; i < parts.length; i++) {
+      if (!parts[i]) continue;
+      cur += parts[i] + '</tr>'; n++;
+      if (n >= per) { chunks.push(cur); cur = ''; n = 0; }
+    }
+    if (cur) chunks.push(cur);
+    return chunks;
+  }
+  function flushStream_() {
+    if (!streamState) return;
+    var st = streamState; streamState = null;
+    var tb = tbodyEl_();
+    if (tb && tb.insertAdjacentHTML) while (st.i < st.chunks.length) { tb.insertAdjacentHTML('beforeend', st.chunks[st.i]); st.i++; }
+    if (st.onDone) st.onDone();
+  }
+  function streamTable_(html, onDone) {
+    var seq = ++renderSeq;
+    streamState = null;
+    var cut = html.indexOf('<tbody>');
+    if (cut < 0) { $('tableWrap').innerHTML = html; if (onDone) onDone(); return; }
+    var head = html.slice(0, cut + 7), rest = html.slice(cut + 7);
+    var end = rest.lastIndexOf('</tbody>');
+    var body = end >= 0 ? rest.slice(0, end) : rest;
+    var chunks = splitRows_(body, 450);
+    $('tableWrap').innerHTML = head + (chunks[0] || '') + '</tbody></table>';
+    if (chunks.length <= 1) { if (onDone) onDone(); return; }
+    var tb = tbodyEl_();
+    if (!tb || !tb.insertAdjacentHTML || typeof requestAnimationFrame !== 'function') {
+      if (tb && tb.insertAdjacentHTML) for (var i = 1; i < chunks.length; i++) tb.insertAdjacentHTML('beforeend', chunks[i]);
+      else $('tableWrap').innerHTML = html;
+      if (onDone) onDone();
+      return;
+    }
+    var st = { seq: seq, chunks: chunks, i: 1, onDone: onDone };
+    streamState = st;
+    var step = function () {
+      if (!streamState || streamState.seq !== seq) return;
+      var tb2 = tbodyEl_();
+      if (!tb2) { streamState = null; return; }
+      var t0 = Date.now();
+      while (st.i < st.chunks.length && Date.now() - t0 < 24) { tb2.insertAdjacentHTML('beforeend', st.chunks[st.i]); st.i++; }
+      if (st.i < st.chunks.length) requestAnimationFrame(step);
+      else { streamState = null; if (st.onDone) st.onDone(); }
+    };
+    requestAnimationFrame(step);
+  }
+
   function renderLatest() {
     var sheet = masterSheet();
     var res = latestValues(P().layers, sheet.name);
@@ -2226,27 +2290,12 @@ if (typeof module !== 'undefined' && module.exports) {
     });
     html += '</tbody></table>';
     exportData = { filename: 'Data-Perencanaan-' + sheet.name + '-Terkini.xlsx', sheetName: sheet.name, aoa: aoa };
-    $('tableWrap').innerHTML = html;
+    streamTable_(html, function () { applyFilter(); });
     var notes = [];
     if (anyDerived) notes.push('Kolom Harga pasangan (Penerimaan, Pemakaian, dan Estimasi Kebutuhan) dihitung otomatis = Jumlah × Harga satuan — cukup isi/upload kolom Jumlah saja.');
     if (anyComputed) notes.push('Kolom Pemakaian dihitung otomatis = Stok Awal + Penerimaan − Stok Akhir Instalasi Farmasi (hasil minus ditampilkan tanpa tanda minus).');
     if (anyMan) notes.push('Sel berwarna krem adalah hasil edit manual (ada di Riwayat Sinkronisasi sebagai "Edit manual").');
     $('tblNote').textContent = notes.join(' ');
-    Array.prototype.forEach.call(document.querySelectorAll('[data-editname]'), function (td) {
-      td.addEventListener('click', function () { editName(td.getAttribute('data-editname')); });
-    });
-    Array.prototype.forEach.call(document.querySelectorAll('[data-editval]'), function (td) {
-      td.addEventListener('click', function () {
-        var parts = td.getAttribute('data-editval').split('|');
-        editValue(parts[0], parts.slice(1).join('|'));
-      });
-    });
-    Array.prototype.forEach.call(document.querySelectorAll('[data-editgrp]'), function (td) {
-      td.addEventListener('click', function () { editGroup(td.getAttribute('data-editgrp')); });
-    });
-    Array.prototype.forEach.call(document.querySelectorAll('[data-delrow]'), function (b) {
-      b.addEventListener('click', function (e) { e.stopPropagation(); openDelDialog(b.getAttribute('data-delrow')); });
-    });
     renderFooter(sheet);
   }
 
@@ -2320,7 +2369,7 @@ if (typeof module !== 'undefined' && module.exports) {
     });
     html += '</tbody></table>';
     exportData = { filename: 'Data-Perencanaan-' + sheet.name + '-' + ui.col.replace(/\s+/g, '-') + '.xlsx', sheetName: sheet.name, aoa: aoa };
-    $('tableWrap').innerHTML = html;
+    streamTable_(html, function () { applyFilter(); });
     $('tblNote').textContent = '';
     renderFooter(sheet);
   }
@@ -2519,6 +2568,25 @@ if (typeof module !== 'undefined' && module.exports) {
     $('selDateA').addEventListener('change', function () { ui.dateA = $('selDateA').value; render(); });
     $('selDateB').addEventListener('change', function () { ui.dateB = $('selDateB').value; render(); });
     $('inSearch').addEventListener('input', function () { ui.q = $('inSearch').value; applyFilter(); });
+    /* delegasi klik sel tabel: satu listener untuk semua baris (ringan, dan
+       tetap bekerja saat baris tabel dialirkan bertahap) */
+    $('tableWrap').addEventListener('click', function (e) {
+      var el = e.target, wrap = $('tableWrap');
+      while (el && el !== wrap) {
+        if (el.getAttribute) {
+          var del = el.getAttribute('data-delrow');
+          if (del) { e.stopPropagation(); openDelDialog(del); return; }
+          var ev = el.getAttribute('data-editval');
+          if (ev) { var parts = ev.split('|'); editValue(parts[0], parts.slice(1).join('|')); return; }
+          var en = el.getAttribute('data-editname');
+          if (en) { editName(en); return; }
+          var eg = el.getAttribute('data-editgrp');
+          if (eg) { editGroup(eg); return; }
+        }
+        el = el.parentNode;
+      }
+    });
+    if (window.addEventListener) window.addEventListener('beforeprint', flushStream_);
     $('chkChanged').addEventListener('change', function () { ui.onlyChanged = $('chkChanged').checked; applyFilter(); });
     $('chkInc').addEventListener('change', function () { ui.onlyInc = $('chkInc').checked; applyFilter(); });
     $('btnPrint').addEventListener('click', function () { window.print(); });
